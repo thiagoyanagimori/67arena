@@ -326,27 +326,25 @@ io.on("connection", (socket) => {
     console.log(`[exit] "${socket.nickname}" returned to menu`);
   });
 
-  // ── WebRTC voice signalling — pure relay, no server processing ─────────────
-  socket.on("voice_offer", ({ sdp }) => {
+  // ── WebRTC signalling — pure relay to the other player in the same match ──
+  // No SDP or ICE data is inspected by the server — just forwarded.
+  function relayToOpponent(socket, event, payload) {
     const matchId  = socketToMatch.get(socket.id);
     const match    = matchId ? matches.get(matchId) : null;
     const opponent = match ? getOpponent(match, socket) : null;
-    opponent?.emit("voice_offer", { sdp });
-  });
+    if (opponent) {
+      opponent.emit(event, payload);
+    }
+  }
 
-  socket.on("voice_answer", ({ sdp }) => {
-    const matchId  = socketToMatch.get(socket.id);
-    const match    = matchId ? matches.get(matchId) : null;
-    const opponent = match ? getOpponent(match, socket) : null;
-    opponent?.emit("voice_answer", { sdp });
-  });
+  socket.on("webrtc_offer",         (payload) => relayToOpponent(socket, "webrtc_offer",         payload));
+  socket.on("webrtc_answer",        (payload) => relayToOpponent(socket, "webrtc_answer",        payload));
+  socket.on("webrtc_ice_candidate", (payload) => relayToOpponent(socket, "webrtc_ice_candidate", payload));
 
-  socket.on("voice_ice", ({ candidate }) => {
-    const matchId  = socketToMatch.get(socket.id);
-    const match    = matchId ? matches.get(matchId) : null;
-    const opponent = match ? getOpponent(match, socket) : null;
-    opponent?.emit("voice_ice", { candidate });
-  });
+  // Legacy voice_* names — relay the same way for backwards compatibility
+  socket.on("voice_offer",  (payload) => relayToOpponent(socket, "webrtc_offer",         payload));
+  socket.on("voice_answer", (payload) => relayToOpponent(socket, "webrtc_answer",        payload));
+  socket.on("voice_ice",    (payload) => relayToOpponent(socket, "webrtc_ice_candidate", payload));
 
   // ── disconnect ─────────────────────────────────────────────────────────────
   socket.on("disconnect", (reason) => {

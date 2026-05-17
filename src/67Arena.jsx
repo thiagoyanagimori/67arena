@@ -36,7 +36,7 @@ const COUNTDOWN_FROM   = 3;
 // ─── ONLINE CONFIG ────────────────────────────────────────────────────────────
 // Set this to your Socket.IO server URL before enabling online mode.
 // When SOCKET_URL is null, online mode shows a "coming soon" stub.
-const SOCKET_URL = "https://six7arena.onrender.com";
+const SOCKET_URL = process.env.REACT_APP_SOCKET_URL || "http://localhost:4000";
 
 // ─── MEDIAPIPE CDNS ───────────────────────────────────────────────────────────
 
@@ -396,10 +396,10 @@ const SocketManager = (() => {
   function voteRematch()       { emit("rematch_vote",   {}); }
   function findAnother()       { emit("find_another",   {}); }
 
-  // ── Voice signalling emitters ─────────────────────────────────────────────
-  function voiceOffer(sdp)     { emit("voice_offer",    { sdp }); }
-  function voiceAnswer(sdp)    { emit("voice_answer",   { sdp }); }
-  function voiceIce(candidate) { emit("voice_ice",      { candidate }); }
+  // ── Voice/video signalling emitters (relay via server, standardised names) ──
+  function voiceOffer(sdp)     { emit("webrtc_offer",         { sdp }); }
+  function voiceAnswer(sdp)    { emit("webrtc_answer",        { sdp }); }
+  function voiceIce(candidate) { emit("webrtc_ice_candidate", { candidate }); }
 
   return { isAvailable, getStatus, onStatusChange, connect, disconnect, on, off, emit,
            joinQueue, leaveQueue, emitRep, emitReady,
@@ -456,53 +456,84 @@ const VoiceEngine = (() => {   // kept as "VoiceEngine" so all existing call-sit
 
   // ── Create RTCPeerConnection and add local tracks ────────────────────────
   function _createPc() {
+    if (pc) { pc.close(); pc = null; }  // clean up any stale connection
     pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
     // Add all local tracks (video + audio) to the peer connection
-    localStream?.getTracks().forEach(t => pc.addTrack(t, localStream));
+    if (localStream) {
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    }
 
     // When remote tracks arrive, wire them to the video element
     pc.ontrack = (e) => {
-      const stream = e.streams[0];
+      console.log("[WebRTC] ontrack fired, streams:", e.streams.length);
+      const stream = e.streams[0] ?? new MediaStream([e.track]);
       if (remoteVideoEl) {
         remoteVideoEl.srcObject = stream;
-        remoteVideoEl.play().catch(() => {});
+        remoteVideoEl.play().catch(err => console.warn("[WebRTC] play():", err));
+      } else {
+        console.warn("[WebRTC] remoteVideoEl not set yet");
       }
     };
 
-    // Relay ICE candidates via the existing socket connection
+    // Relay ICE candidates via the standardised webrtc_ event names
     pc.onicecandidate = (e) => {
-      if (e.candidate) SocketManager.emit("voice_ice", { candidate: e.candidate });
+      if (e.candidate) {
+        SocketManager.emit("webrtc_ice_candidate", { candidate: e.candidate });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log("[WebRTC] connection state:", pc?.connectionState);
     };
   }
 
   // ── Start call — isInitiator=true sends the offer ────────────────────────
   async function startCall(isInitiator) {
-    if (!localStream) return;
-    _createPc();
+    _createPc();  // always create fresh PC; localStream may be null (mic-denied) — still ok
     if (isInitiator) {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      SocketManager.emit("voice_offer", { sdp: offer });
+      try {
+        const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
+        await pc.setLocalDescription(offer);
+        SocketManager.emit("webrtc_offer", { sdp: pc.localDescription });
+        console.log("[WebRTC] offer sent");
+      } catch (err) {
+        console.error("[WebRTC] startCall error:", err);
+      }
     }
   }
 
-  // ── Handle incoming offer from opponent ──────────────────────────────────
+  // ── Handle incoming offer from opponent (non-initiator) ──────────────────
   async function handleOffer(sdp) {
-    // Non-initiator creates PC on first offer
-    if (!pc) _createPc();
-    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    SocketManager.emit("voice_answer", { sdp: answer });
+    try {
+      if (!pc) _createPc();
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      SocketManager.emit("webrtc_answer", { sdp: pc.localDescription });
+      console.log("[WebRTC] answer sent");
+    } catch (err) {
+      console.error("[WebRTC] handleOffer error:", err);
+    }
   }
 
   async function handleAnswer(sdp) {
-    await pc?.setRemoteDescription(new RTCSessionDescription(sdp));
+    try {
+      await pc?.setRemoteDescription(new RTCSessionDescription(sdp));
+      console.log("[WebRTC] remote description set (answer)");
+    } catch (err) {
+      console.error("[WebRTC] handleAnswer error:", err);
+    }
   }
 
   async function handleIce(candidate) {
-    try { await pc?.addIceCandidate(new RTCIceCandidate(candidate)); } catch {}
+    try {
+      if (pc && candidate) {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    } catch (err) {
+      console.warn("[WebRTC] addIceCandidate:", err);
+    }
   }
 
   // ── Mute / unmute mic ────────────────────────────────────────────────────
@@ -1142,16 +1173,20 @@ export default function Arena67() {
     SocketManager.on("match_found", ({ opponentNickname, isInitiator }) => {
       syncUi({ phase: "online-found", opponentNickname, voiceStatus: "connecting" });
       playSound("matchFound");
-      // Start WebRTC call — server tells us who sends the offer
-      VoiceEngine.startCall(isInitiator).then(() => {
-        syncUi({ voiceStatus: micStatusRef.current === "granted" ? "active" : "off" });
-      });
+      // Give React a tick to mount the remote <video> element before starting WebRTC
+      setTimeout(() => {
+        // Re-wire the video element ref in case it wasn't available before
+        VoiceEngine.setRemoteVideoEl(remoteVideoRef.current);
+        VoiceEngine.startCall(isInitiator).then(() => {
+          syncUi({ voiceStatus: micStatusRef.current === "granted" ? "active" : "off" });
+        });
+      }, 200);
     });
 
-    // ── Voice signalling relay ────────────────────────────────────────────────
-    SocketManager.on("voice_offer",  ({ sdp }) => VoiceEngine.handleOffer(sdp));
-    SocketManager.on("voice_answer", ({ sdp }) => VoiceEngine.handleAnswer(sdp));
-    SocketManager.on("voice_ice",    ({ candidate }) => VoiceEngine.handleIce(candidate));
+    // ── WebRTC signalling relay (standardised webrtc_ names) ─────────────────
+    SocketManager.on("webrtc_offer",         ({ sdp }) => VoiceEngine.handleOffer(sdp));
+    SocketManager.on("webrtc_answer",        ({ sdp }) => VoiceEngine.handleAnswer(sdp));
+    SocketManager.on("webrtc_ice_candidate", ({ candidate }) => VoiceEngine.handleIce(candidate));
 
     SocketManager.on("countdown_tick", ({ count }) => {
       syncUi({ phase: "online-countdown", countdown: count });
@@ -1163,12 +1198,15 @@ export default function Arena67() {
       game.score = 0; game.repState = { left: "idle", right: "idle" };
       game.phase = "online-playing"; game.timeLeft = GAME_DURATION;
       game.combo = 0; game.lastComboTime = 0;
-      syncUi({ phase: "online-playing", gameMode: "online",   // ← ensures emitRep fires
+      syncUi({ phase: "online-playing", gameMode: "online",
                 score: 0, opponentScore: 0, timeLeft: GAME_DURATION });
       SoundEngine.matchStart();
+      // Re-wire the remote video element — the split-screen panel mounts on this phase
+      setTimeout(() => VoiceEngine.setRemoteVideoEl(remoteVideoRef.current), 100);
       timerRef.current = setInterval(() => {
         game.timeLeft--;
         syncUi({ timeLeft: game.timeLeft });
+        if (game.timeLeft <= 3 && game.timeLeft > 0) playSound("timerWarn");
       }, 1000);
     });
 
@@ -1224,7 +1262,7 @@ export default function Arena67() {
     });
 
     return () => {
-      ["match_found","voice_offer","voice_answer","voice_ice",
+      ["match_found","webrtc_offer","webrtc_answer","webrtc_ice_candidate",
        "countdown_tick","match_start","opponent_rep","match_end",
        "opponent_rematch_vote","rematch_starting","opponent_declined_rematch",
        "opponent_left"].forEach(SocketManager.off);
