@@ -36,7 +36,7 @@ const COUNTDOWN_FROM   = 3;
 // ─── ONLINE CONFIG ────────────────────────────────────────────────────────────
 // Set this to your Socket.IO server URL before enabling online mode.
 // When SOCKET_URL is null, online mode shows a "coming soon" stub.
-const SOCKET_URL = process.env.REACT_APP_SOCKET_URL || "http://localhost:4000";
+const SOCKET_URL = "https://six7arena.onrender.com";
 
 // ─── MEDIAPIPE CDNS ───────────────────────────────────────────────────────────
 
