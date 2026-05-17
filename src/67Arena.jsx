@@ -406,62 +406,80 @@ const SocketManager = (() => {
            voteRematch, findAnother, voiceOffer, voiceAnswer, voiceIce };
 })();
 
-// ─── VOICE ENGINE — WebRTC peer-to-peer audio between matched players ─────────
-// Uses the server as a signalling relay (offer/answer/ICE via Socket.IO).
-// No audio data flows through the server — only signalling messages.
+// ─── MEDIA ENGINE — WebRTC video+audio between matched players ───────────────
+// Replaces VoiceEngine. Camera + mic both included.
+// Remote stream is displayed in a <video> element whose ref is exposed.
 //
-// SERVER SIGNALLING CONTRACT (add to server.js):
-//   Client emits:  voice_offer   { sdp }     → relay to room partner
-//                  voice_answer  { sdp }      → relay to room partner
+// SERVER SIGNALLING CONTRACT (server.js already handles these):
+//   Client emits:  voice_offer   { sdp }      → relay to room partner
+//                  voice_answer  { sdp }       → relay to room partner
 //                  voice_ice     { candidate } → relay to room partner
-//   Server emits same events back to the other socket in the match room.
-//
-// ICE servers: using public STUN. For production, add TURN credentials.
-const VoiceEngine = (() => {
-  let pc          = null;   // RTCPeerConnection
-  let localStream = null;   // microphone MediaStream
-  let remoteAudio = null;   // <audio> element for opponent
-  let _muted      = false;
+const VoiceEngine = (() => {   // kept as "VoiceEngine" so all existing call-sites work
+  let pc            = null;
+  let localStream   = null;    // camera + mic MediaStream (local player)
+  let remoteVideoEl = null;    // <video> element for opponent feed (set via setRemoteVideoEl)
+  let _muted        = false;
+  let _camOff       = false;
 
   const ICE_SERVERS = [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
   ];
 
-  // ── Request microphone access ────────────────────────────────────────────
+  // ── Set the <video> element the remote stream should play into ───────────
+  // Call this from the component after the ref is attached.
+  function setRemoteVideoEl(el) { remoteVideoEl = el; }
+
+  // ── Request camera + microphone ──────────────────────────────────────────
   // Returns: "granted" | "denied" | "unavailable"
   async function requestMic() {
     if (!navigator.mediaDevices?.getUserMedia) return "unavailable";
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      // Ask for both video and audio for the online call.
+      // The existing MediaPipe camera (videoRef) runs separately — we request
+      // a second stream here purely for the WebRTC peer connection.
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: "user" },
+        audio: true,
+      });
       return "granted";
     } catch (e) {
-      return "denied";
+      // Fallback: try audio-only if camera is blocked
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        return "granted";
+      } catch {
+        return "denied";
+      }
     }
   }
 
-  // ── Start WebRTC as the initiating peer (called after match_found) ────────
-  async function startCall(isInitiator) {
-    if (!localStream) return;
+  // ── Create RTCPeerConnection and add local tracks ────────────────────────
+  function _createPc() {
     pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    // Add all local tracks (video + audio) to the peer connection
+    localStream?.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-    // Play remote audio
+    // When remote tracks arrive, wire them to the video element
     pc.ontrack = (e) => {
-      if (!remoteAudio) {
-        remoteAudio = document.createElement("audio");
-        remoteAudio.autoplay = true;
-        document.body.appendChild(remoteAudio);
+      const stream = e.streams[0];
+      if (remoteVideoEl) {
+        remoteVideoEl.srcObject = stream;
+        remoteVideoEl.play().catch(() => {});
       }
-      remoteAudio.srcObject = e.streams[0];
     };
 
-    // Relay ICE candidates via socket
+    // Relay ICE candidates via the existing socket connection
     pc.onicecandidate = (e) => {
       if (e.candidate) SocketManager.emit("voice_ice", { candidate: e.candidate });
     };
+  }
 
+  // ── Start call — isInitiator=true sends the offer ────────────────────────
+  async function startCall(isInitiator) {
+    if (!localStream) return;
+    _createPc();
     if (isInitiator) {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -469,43 +487,54 @@ const VoiceEngine = (() => {
     }
   }
 
-  // ── Handle incoming offer from opponent ───────────────────────────────────
+  // ── Handle incoming offer from opponent ──────────────────────────────────
   async function handleOffer(sdp) {
-    if (!pc) return;
+    // Non-initiator creates PC on first offer
+    if (!pc) _createPc();
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     SocketManager.emit("voice_answer", { sdp: answer });
   }
 
-  // ── Handle incoming answer ────────────────────────────────────────────────
   async function handleAnswer(sdp) {
     await pc?.setRemoteDescription(new RTCSessionDescription(sdp));
   }
 
-  // ── Handle incoming ICE candidate ─────────────────────────────────────────
   async function handleIce(candidate) {
     try { await pc?.addIceCandidate(new RTCIceCandidate(candidate)); } catch {}
   }
 
-  // ── Mute / unmute local mic ────────────────────────────────────────────────
+  // ── Mute / unmute mic ────────────────────────────────────────────────────
   function setMuted(muted) {
     _muted = muted;
     localStream?.getAudioTracks().forEach(t => { t.enabled = !muted; });
   }
-
   function isMuted() { return _muted; }
 
-  // ── Tear down call and release mic ────────────────────────────────────────
+  // ── Camera on/off ────────────────────────────────────────────────────────
+  function setCamOff(off) {
+    _camOff = off;
+    localStream?.getVideoTracks().forEach(t => { t.enabled = !off; });
+  }
+  function isCamOff() { return _camOff; }
+
+  // ── Tear down ─────────────────────────────────────────────────────────────
   function hangup() {
     pc?.close(); pc = null;
     localStream?.getTracks().forEach(t => t.stop()); localStream = null;
-    if (remoteAudio) { remoteAudio.srcObject = null; remoteAudio.remove(); remoteAudio = null; }
-    _muted = false;
+    if (remoteVideoEl) { remoteVideoEl.srcObject = null; }
+    remoteVideoEl = null;
+    _muted = false; _camOff = false;
   }
 
-  return { requestMic, startCall, handleOffer, handleAnswer, handleIce,
-           setMuted, isMuted, hangup };
+  // ── Check if we have a video track (for UI) ──────────────────────────────
+  function hasVideo() {
+    return (localStream?.getVideoTracks().length ?? 0) > 0;
+  }
+
+  return { requestMic, setRemoteVideoEl, startCall, handleOffer, handleAnswer,
+           handleIce, setMuted, isMuted, setCamOff, isCamOff, hasVideo, hangup };
 })();
 
 function loadScript(src) {
@@ -761,7 +790,13 @@ export default function Arena67() {
   const shakeTimerRef   = useRef(null);
   const plusOneTimerRef = useRef(null);
   const pendingEntryRef = useRef(null);
-  const micStatusRef    = useRef("idle"); // "idle"|"requesting"|"granted"|"denied"|"unavailable"
+  const micStatusRef    = useRef("idle");
+  const remoteVideoRef  = useRef(null);  // <video> element for opponent camera feed
+
+  // Wire the remote video element into VoiceEngine as soon as it's available
+  useEffect(() => {
+    VoiceEngine.setRemoteVideoEl(remoteVideoRef.current);
+  }, []);
 
   // ── Game state ref (single source of truth — easy to sync via Socket.IO) ──
   // To extend for multiplayer, replace with:
@@ -808,6 +843,7 @@ export default function Arena67() {
     micStatus:        "idle",
     micMuted:         false,
     voiceStatus:      "off",
+    camOff:           false,
     // Rematch
     rematchState:     "idle",
     myRematchVote:    false,
@@ -901,7 +937,8 @@ export default function Arena67() {
       const armConnections = window.POSE_CONNECTIONS.filter(([a, b]) =>
         [11, 12, 13, 14, 15, 16].includes(a) && [11, 12, 13, 14, 15, 16].includes(b)
       );
-      const skeletonColor = game.phase === "playing" ? "#ff6200" : "rgba(255,255,255,0.25)";
+      const skeletonColor = (game.phase === "playing" || game.phase === "online-playing")
+        ? "#ff6200" : "rgba(255,255,255,0.25)";
       window.drawConnectors(ctx, lm, armConnections, { color: skeletonColor, lineWidth: 3 });
       window.drawLandmarks(ctx, [
         lm[LM.LEFT_SHOULDER],  lm[LM.RIGHT_SHOULDER],
@@ -911,10 +948,10 @@ export default function Arena67() {
     }
     ctx.restore();
 
-    // ── Rep detection — only during active play ────────────────────────────
+    // ── Rep detection — only during active play (solo or online) ─────────────
     // NOTE: we intentionally DO NOT track face or body shape —
     //       only wrist/shoulder Y positions are compared.
-    if (game.phase !== "playing") return;
+    if (game.phase !== "playing" && game.phase !== "online-playing") return;
 
     for (const side of ["left", "right"]) {
       const shoulderIdx = side === "left" ? LM.LEFT_SHOULDER  : LM.RIGHT_SHOULDER;
@@ -1072,7 +1109,8 @@ export default function Arena67() {
     SocketManager.leaveQueue();
     SocketManager.disconnect();
     VoiceEngine.hangup();
-    syncUi({ phase: "menu", onlineError: "", micStatus: "idle", voiceStatus: "off" });
+    syncUi({ phase: "menu", onlineError: "", micStatus: "idle",
+              voiceStatus: "off", camOff: false });
   }, [syncUi]);
 
   // ── Rematch callbacks ────────────────────────────────────────────────────────
@@ -1093,7 +1131,8 @@ export default function Arena67() {
   const handleExitOnline = useCallback(() => {
     VoiceEngine.hangup();
     SocketManager.disconnect();
-    syncUi({ phase: "menu", rematchState: "idle", micStatus: "idle", voiceStatus: "off" });
+    syncUi({ phase: "menu", rematchState: "idle", micStatus: "idle",
+              voiceStatus: "off", camOff: false });
   }, [syncUi]);
 
   // ── Online: socket event listeners ─────────────────────────────────────────
@@ -1124,8 +1163,8 @@ export default function Arena67() {
       game.score = 0; game.repState = { left: "idle", right: "idle" };
       game.phase = "online-playing"; game.timeLeft = GAME_DURATION;
       game.combo = 0; game.lastComboTime = 0;
-      syncUi({ phase: "online-playing", score: 0, opponentScore: 0,
-                timeLeft: GAME_DURATION });
+      syncUi({ phase: "online-playing", gameMode: "online",   // ← ensures emitRep fires
+                score: 0, opponentScore: 0, timeLeft: GAME_DURATION });
       SoundEngine.matchStart();
       timerRef.current = setInterval(() => {
         game.timeLeft--;
@@ -1227,7 +1266,7 @@ export default function Arena67() {
     lbEntries, lbLatestDate,
     gameMode, onlineNickname,
     opponentNickname, opponentScore, onlineError,
-    micStatus, micMuted, voiceStatus,
+    micStatus, micMuted, voiceStatus, camOff,
     rematchState, myRematchVote, opponentRematchVote,
     serverStatus,
   } = ui;
@@ -1251,11 +1290,53 @@ export default function Arena67() {
         <div className="arena-root" style={{
           animation: screenShake ? "arena-screenshake 0.28s ease" : "none",
         }}>
-        {/* Hidden video source for MediaPipe */}
+        {/* Hidden video source for MediaPipe — always present */}
         <video ref={videoRef} style={S.hiddenVideo} playsInline muted />
 
-        {/* Mirrored camera + skeleton canvas */}
-        <canvas ref={canvasRef} width={640} height={480} style={S.canvas} />
+        {/* ── Video layer: solo = full canvas; online = split 50/50 ── */}
+        {phase === "online-playing" || phase === "online-countdown" ? (
+          // Online: local (left) + opponent (right) side-by-side
+          <div style={{
+            position: "absolute", inset: 0,
+            display: "flex", flexDirection: "row",
+          }}>
+            {/* Local player — left half, mirrored canvas */}
+            <div style={{ flex: 1, position: "relative", overflow: "hidden",
+                          borderRight: "1px solid rgba(255,98,0,0.3)" }}>
+              <canvas ref={canvasRef} width={640} height={480} style={{
+                ...S.canvas,
+                width: "100%", height: "100%",
+              }} />
+              {/* Local label */}
+              <div style={S.videoLabel}>
+                <span style={S.videoLabelText}>
+                  {camOff ? "📷 CAM OFF" : "YOU"}
+                </span>
+              </div>
+            </div>
+            {/* Opponent — right half, raw WebRTC video */}
+            <div style={{ flex: 1, position: "relative", overflow: "hidden",
+                          background: "#0a0a0f" }}>
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                style={{
+                  width: "100%", height: "100%",
+                  objectFit: "cover",
+                  transform: "scaleX(-1)",  // mirror opponent feed
+                }}
+              />
+              {/* Opponent label */}
+              <div style={{ ...S.videoLabel, right: 0, left: "auto" }}>
+                <span style={S.videoLabelText}>{opponentNickname || "OPPONENT"}</span>
+              </div>
+            </div>
+          </div>
+        ) : (
+          // Solo / other phases: full-width canvas as before
+          <canvas ref={canvasRef} width={640} height={480} style={S.canvas} />
+        )}
 
         {/* Vignette */}
         <div style={S.vignette} />
@@ -1416,6 +1497,7 @@ export default function Arena67() {
                     <div style={{ display: "flex", flexDirection: "column",
                                   alignItems: "center", gap: 3 }}>
                       <div style={S.onlineVs}>VS</div>
+                      {/* Mute button */}
                       <button
                         onClick={() => {
                           const next = !micMuted;
@@ -1431,8 +1513,28 @@ export default function Arena67() {
                         }}
                         title={micMuted ? "Unmute mic" : "Mute mic"}
                       >
-                        {micMuted ? "🔇" : voiceStatus === "active" ? "🎙️" : "🔕"}
+                        {micMuted ? "🔇" : "🎙️"}
                       </button>
+                      {/* Camera toggle */}
+                      {VoiceEngine.hasVideo() && (
+                        <button
+                          onClick={() => {
+                            const next = !camOff;
+                            VoiceEngine.setCamOff(next);
+                            syncUi({ camOff: next });
+                          }}
+                          style={{
+                            ...S.muteBtn,
+                            background: camOff ? "rgba(255,50,50,0.2)" : "rgba(255,98,0,0.15)",
+                            border: `1px solid ${camOff ? "#ff3333" : "#ff6200"}`,
+                            color: camOff ? "#ff4444" : "#ff6200",
+                            pointerEvents: "all",
+                          }}
+                          title={camOff ? "Turn camera on" : "Turn camera off"}
+                        >
+                          {camOff ? "📷" : "🎥"}
+                        </button>
+                      )}
                     </div>
                     <div style={{ ...S.onlinePlayerChip, textAlign: "right" }}>
                       <span style={S.onlineChipName}>{opponentNickname || "OPPONENT"}</span>
@@ -2522,6 +2624,25 @@ const S = {
     border: "1.5px solid rgba(255,98,0,0.2)",
     animation: "arena-radar 1.8s ease-out infinite",
     animationDelay: "1.2s",
+  },
+
+  // ── Video player name labels (online split-screen) ───────────────────────────
+  videoLabel: {
+    position: "absolute", bottom: 6, left: 6,
+    background: "rgba(0,0,0,0.6)",
+    borderRadius: 6,
+    padding: "2px 8px",
+    backdropFilter: "blur(4px)",
+    pointerEvents: "none",
+    zIndex: 5,
+  },
+  videoLabelText: {
+    fontFamily: "'Barlow Condensed', sans-serif",
+    fontWeight: 700,
+    fontSize: "clamp(9px,1.2vw,13px)",
+    color: "rgba(255,255,255,0.85)",
+    letterSpacing: "0.1em",
+    textTransform: "uppercase",
   },
 
   // ── Mute button (inside online HUD) ──────────────────────────────────────────
