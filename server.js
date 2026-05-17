@@ -241,21 +241,24 @@ io.on("connection", (socket) => {
     console.log(`[queue] "${socket.nickname}" left queue`);
   });
 
-  // ── rep_scored ─────────────────────────────────────────────────────────────
-  // Player scored a rep — update server score and relay to opponent
-  socket.on("rep_scored", ({ score, combo } = {}) => {
+  // ── rep_scored / score_update ──────────────────────────────────────────────
+  // Both names accepted — frontend uses rep_scored, score_update is an alias
+  function handleRepScored(socket, { score, combo } = {}) {
     const matchId = socketToMatch.get(socket.id);
     if (!matchId) return;
     const match = matches.get(matchId);
     if (!match || match.phase !== "playing") return;
 
     const idx = playerIndex(match, socket);
-    // Trust the client score (anti-cheat: validate against combo/time if needed)
     match.scores[idx] = typeof score === "number" ? score : match.scores[idx] + 1;
+    console.log(`[score] ${socket.nickname}=${match.scores[idx]}`);
 
     const opponent = getOpponent(match, socket);
     opponent?.emit("opponent_rep", { score: match.scores[idx], combo });
-  });
+  }
+
+  socket.on("rep_scored",   (data) => handleRepScored(socket, data));
+  socket.on("score_update", (data) => handleRepScored(socket, data));
 
   // ── client_ready ───────────────────────────────────────────────────────────
   // Reserved — ack from client that it received countdown. No action needed yet.
@@ -326,22 +329,25 @@ io.on("connection", (socket) => {
     console.log(`[exit] "${socket.nickname}" returned to menu`);
   });
 
-  // ── WebRTC signalling — pure relay to the other player in the same match ──
-  // No SDP or ICE data is inspected by the server — just forwarded.
+  // ── WebRTC signalling — relay to opponent in same match ───────────────────
+  // Server does NOT inspect SDP/ICE — just forwards to the other socket.
+  // CRITICAL: relay must happen AFTER socketToMatch is set (it is, in startMatch).
   function relayToOpponent(socket, event, payload) {
     const matchId  = socketToMatch.get(socket.id);
     const match    = matchId ? matches.get(matchId) : null;
     const opponent = match ? getOpponent(match, socket) : null;
     if (opponent) {
       opponent.emit(event, payload);
+      console.log(`[relay] ${event} from ${socket.id.slice(0,6)} to ${opponent.id.slice(0,6)}`);
+    } else {
+      console.warn(`[relay] ${event} — no opponent found for ${socket.id.slice(0,6)} (matchId: ${matchId})`);
     }
   }
 
   socket.on("webrtc_offer",         (payload) => relayToOpponent(socket, "webrtc_offer",         payload));
   socket.on("webrtc_answer",        (payload) => relayToOpponent(socket, "webrtc_answer",        payload));
   socket.on("webrtc_ice_candidate", (payload) => relayToOpponent(socket, "webrtc_ice_candidate", payload));
-
-  // Legacy voice_* names — relay the same way for backwards compatibility
+  // Legacy names — map to standardised events
   socket.on("voice_offer",  (payload) => relayToOpponent(socket, "webrtc_offer",         payload));
   socket.on("voice_answer", (payload) => relayToOpponent(socket, "webrtc_answer",        payload));
   socket.on("voice_ice",    (payload) => relayToOpponent(socket, "webrtc_ice_candidate", payload));

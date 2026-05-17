@@ -414,37 +414,42 @@ const SocketManager = (() => {
 //   Client emits:  voice_offer   { sdp }      → relay to room partner
 //                  voice_answer  { sdp }       → relay to room partner
 //                  voice_ice     { candidate } → relay to room partner
-const VoiceEngine = (() => {   // kept as "VoiceEngine" so all existing call-sites work
-  let pc            = null;
-  let localStream   = null;    // camera + mic MediaStream (local player)
-  let remoteVideoEl = null;    // <video> element for opponent feed (set via setRemoteVideoEl)
-  let _muted        = false;
-  let _camOff       = false;
+const VoiceEngine = (() => {
+  let pc             = null;
+  let localStream    = null;
+  let remoteVideoEl  = null;
+  let _muted         = false;
+  let _camOff        = false;
+  let _pendingIce    = [];
+  let _remoteDescSet = false;
 
   const ICE_SERVERS = [
     { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
   ];
 
-  // ── Set the <video> element the remote stream should play into ───────────
-  // Call this from the component after the ref is attached.
-  function setRemoteVideoEl(el) { remoteVideoEl = el; }
+  function setRemoteVideoEl(el) {
+    remoteVideoEl = el;
+    // If tracks already arrived before element mounted, wire them now
+    if (el && pc) {
+      const tracks = pc.getReceivers().map(r => r.track).filter(Boolean);
+      if (tracks.length > 0) {
+        const s = new MediaStream(tracks);
+        el.srcObject = s;
+        el.play().catch(() => {});
+      }
+    }
+  }
 
-  // ── Request camera + microphone ──────────────────────────────────────────
-  // Returns: "granted" | "denied" | "unavailable"
   async function requestMic() {
     if (!navigator.mediaDevices?.getUserMedia) return "unavailable";
     try {
-      // Ask for both video and audio for the online call.
-      // The existing MediaPipe camera (videoRef) runs separately — we request
-      // a second stream here purely for the WebRTC peer connection.
       localStream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: "user" },
         audio: true,
       });
       return "granted";
-    } catch (e) {
-      // Fallback: try audio-only if camera is blocked
+    } catch {
       try {
         localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
         return "granted";
@@ -454,114 +459,107 @@ const VoiceEngine = (() => {   // kept as "VoiceEngine" so all existing call-sit
     }
   }
 
-  // ── Create RTCPeerConnection and add local tracks ────────────────────────
   function _createPc() {
-    if (pc) { pc.close(); pc = null; }  // clean up any stale connection
+    if (pc) { try { pc.close(); } catch {} }
+    pc = null; _pendingIce = []; _remoteDescSet = false;
+
     pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-    // Add all local tracks (video + audio) to the peer connection
     if (localStream) {
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      console.log("[WebRTC] local tracks:", localStream.getTracks().map(t => t.kind));
+    } else {
+      console.warn("[WebRTC] no localStream");
     }
 
-    // When remote tracks arrive, wire them to the video element
     pc.ontrack = (e) => {
-      console.log("[WebRTC] ontrack fired, streams:", e.streams.length);
-      const stream = e.streams[0] ?? new MediaStream([e.track]);
+      console.log("[WebRTC] ontrack:", e.track.kind);
+      const stream = e.streams[0] ?? (() => { const s = new MediaStream(); s.addTrack(e.track); return s; })();
       if (remoteVideoEl) {
         remoteVideoEl.srcObject = stream;
-        remoteVideoEl.play().catch(err => console.warn("[WebRTC] play():", err));
+        remoteVideoEl.play().catch(err => console.warn("[WebRTC] play:", err));
       } else {
-        console.warn("[WebRTC] remoteVideoEl not set yet");
+        console.warn("[WebRTC] remoteVideoEl not ready yet");
       }
     };
 
-    // Relay ICE candidates via the standardised webrtc_ event names
     pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        SocketManager.emit("webrtc_ice_candidate", { candidate: e.candidate });
-      }
+      if (e.candidate) SocketManager.emit("webrtc_ice_candidate", { candidate: e.candidate.toJSON() });
     };
 
-    pc.onconnectionstatechange = () => {
-      console.log("[WebRTC] connection state:", pc?.connectionState);
-    };
+    pc.onconnectionstatechange = () => console.log("[WebRTC] conn:", pc?.connectionState);
+    pc.onsignalingstatechange  = () => console.log("[WebRTC] sig:",  pc?.signalingState);
   }
 
-  // ── Start call — isInitiator=true sends the offer ────────────────────────
+  async function _flushIce() {
+    for (const c of _pendingIce) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+    }
+    _pendingIce = [];
+  }
+
+  // Both players call startCall on match_found; initiator creates the offer
   async function startCall(isInitiator) {
-    _createPc();  // always create fresh PC; localStream may be null (mic-denied) — still ok
+    _createPc();
     if (isInitiator) {
       try {
         const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
         await pc.setLocalDescription(offer);
         SocketManager.emit("webrtc_offer", { sdp: pc.localDescription });
         console.log("[WebRTC] offer sent");
-      } catch (err) {
-        console.error("[WebRTC] startCall error:", err);
-      }
+      } catch (err) { console.error("[WebRTC] createOffer:", err); }
     }
   }
 
-  // ── Handle incoming offer from opponent (non-initiator) ──────────────────
   async function handleOffer(sdp) {
     try {
       if (!pc) _createPc();
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      _remoteDescSet = true;
+      await _flushIce();
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       SocketManager.emit("webrtc_answer", { sdp: pc.localDescription });
       console.log("[WebRTC] answer sent");
-    } catch (err) {
-      console.error("[WebRTC] handleOffer error:", err);
-    }
+    } catch (err) { console.error("[WebRTC] handleOffer:", err); }
   }
 
   async function handleAnswer(sdp) {
     try {
       await pc?.setRemoteDescription(new RTCSessionDescription(sdp));
-      console.log("[WebRTC] remote description set (answer)");
-    } catch (err) {
-      console.error("[WebRTC] handleAnswer error:", err);
-    }
+      _remoteDescSet = true;
+      await _flushIce();
+      console.log("[WebRTC] answer set");
+    } catch (err) { console.error("[WebRTC] handleAnswer:", err); }
   }
 
   async function handleIce(candidate) {
+    if (!candidate) return;
     try {
-      if (pc && candidate) {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      const ice = new RTCIceCandidate(candidate);
+      if (_remoteDescSet && pc) {
+        await pc.addIceCandidate(ice);
+      } else {
+        _pendingIce.push(candidate);
+        console.log("[WebRTC] ICE buffered");
       }
-    } catch (err) {
-      console.warn("[WebRTC] addIceCandidate:", err);
-    }
+    } catch (err) { console.warn("[WebRTC] addIce:", err); }
   }
 
-  // ── Mute / unmute mic ────────────────────────────────────────────────────
-  function setMuted(muted) {
-    _muted = muted;
-    localStream?.getAudioTracks().forEach(t => { t.enabled = !muted; });
-  }
+  function setMuted(muted) { _muted = muted; localStream?.getAudioTracks().forEach(t => { t.enabled = !muted; }); }
   function isMuted() { return _muted; }
-
-  // ── Camera on/off ────────────────────────────────────────────────────────
-  function setCamOff(off) {
-    _camOff = off;
-    localStream?.getVideoTracks().forEach(t => { t.enabled = !off; });
-  }
+  function setCamOff(off) { _camOff = off; localStream?.getVideoTracks().forEach(t => { t.enabled = !off; }); }
   function isCamOff() { return _camOff; }
+  function hasVideo() { return (localStream?.getVideoTracks().length ?? 0) > 0; }
 
-  // ── Tear down ─────────────────────────────────────────────────────────────
   function hangup() {
-    pc?.close(); pc = null;
+    try { pc?.close(); } catch {}
+    pc = null;
     localStream?.getTracks().forEach(t => t.stop()); localStream = null;
-    if (remoteVideoEl) { remoteVideoEl.srcObject = null; }
+    if (remoteVideoEl) remoteVideoEl.srcObject = null;
     remoteVideoEl = null;
-    _muted = false; _camOff = false;
-  }
-
-  // ── Check if we have a video track (for UI) ──────────────────────────────
-  function hasVideo() {
-    return (localStream?.getVideoTracks().length ?? 0) > 0;
+    _pendingIce = []; _remoteDescSet = false; _muted = false; _camOff = false;
+    console.log("[WebRTC] hangup");
   }
 
   return { requestMic, setRemoteVideoEl, startCall, handleOffer, handleAnswer,
@@ -835,10 +833,11 @@ export default function Arena67() {
   const gameRef = useRef({
     score:        0,
     repState:     { left: "idle", right: "idle" },
-    phase:        "idle",   // idle | countdown | playing | done
+    phase:        "idle",
     timeLeft:     GAME_DURATION,
     combo:        0,
     lastComboTime: 0,
+    gameMode:     null,   // "solo" | "online" — kept here to avoid stale closure in scoreRep
   });
 
   // ── React UI state (derived from gameRef for rendering) ────────────────────
@@ -914,8 +913,8 @@ export default function Arena67() {
     const tier = getComboTier(game.combo);
     SoundEngine.repScored(game.combo);
 
-    // Emit to server in online mode — server rebroadcasts to opponent
-    if (ui.gameMode === "online") SocketManager.emitRep(game.score, game.combo);
+    // Emit to server in online mode — read from gameRef, not ui (avoids stale closure)
+    if (game.gameMode === "online") SocketManager.emitRep(game.score, game.combo);
 
     // Trigger all visual feedback simultaneously
     syncUi({
@@ -1055,6 +1054,7 @@ export default function Arena67() {
     game.score = 0; game.repState = { left: "idle", right: "idle" };
     game.phase = "countdown"; game.timeLeft = GAME_DURATION;
     game.combo = 0; game.lastComboTime = 0;
+    game.gameMode = "solo";
 
     syncUi({
       phase: "countdown", gameMode: "solo", score: 0, timeLeft: GAME_DURATION,
@@ -1198,6 +1198,7 @@ export default function Arena67() {
       game.score = 0; game.repState = { left: "idle", right: "idle" };
       game.phase = "online-playing"; game.timeLeft = GAME_DURATION;
       game.combo = 0; game.lastComboTime = 0;
+      game.gameMode = "online";  // read by scoreRep — avoids stale ui closure
       syncUi({ phase: "online-playing", gameMode: "online",
                 score: 0, opponentScore: 0, timeLeft: GAME_DURATION });
       SoundEngine.matchStart();
